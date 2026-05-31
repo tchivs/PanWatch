@@ -23,19 +23,30 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-# 缓存:在 patch 上下文里把 PanWatch 拉好的数据塞这里,patch 命中时直接返回
-_PANWATCH_DATA_CACHE: dict[str, Any] = {}
+# 缓存:在 patch 上下文里把 PanWatch 拉好的数据塞这里,patch 命中时直接返回。
+# 用 ContextVar 而非模块级 dict:深度分析跑在 asyncio.to_thread worker 线程,
+# to_thread 会 copy_context(),每个并发任务拿到独立副本 —— 避免两只标的并发
+# 分析时互相覆盖数据(广汽 601238 的报告混入赛力斯 601127 的 K线/新闻)。
+_PANWATCH_DATA: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "_TA_PANWATCH_DATA", default={}
+)
 
 # 跟随当前请求的 trace_id;toolkit hit/miss 日志归属到这次分析
 _CURRENT_TRACE_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_TA_TRACE_ID", default=""
 )
+
+
+def _cache() -> dict[str, Any]:
+    """读当前 context 的 PanWatch 数据快照(并发隔离)。"""
+    return _PANWATCH_DATA.get()
 
 
 @contextmanager
@@ -46,17 +57,16 @@ def panwatch_data_context(data: dict[str, Any], trace_id: str = ""):
         data: 含 stock / quote / klines / events / capital_flow 的字典
         trace_id: 本次分析的 trace_id,用于把 toolkit 命中日志归属到该运行
 
-    退出 context 时清空数据,避免跨请求污染。
+    退出 context 时还原数据。基于 ContextVar,并发任务(及其 to_thread worker)
+    互不干扰。
     """
-    global _PANWATCH_DATA_CACHE
-    prev = _PANWATCH_DATA_CACHE
-    _PANWATCH_DATA_CACHE = dict(data)
-    token = _CURRENT_TRACE_ID.set(trace_id or "")
+    token = _PANWATCH_DATA.set(dict(data))
+    tid_token = _CURRENT_TRACE_ID.set(trace_id or "")
     try:
         yield
     finally:
-        _PANWATCH_DATA_CACHE = prev
-        _CURRENT_TRACE_ID.reset(token)
+        _PANWATCH_DATA.reset(token)
+        _CURRENT_TRACE_ID.reset(tid_token)
 
 
 def _emit_toolkit_log(level: str, action: str, method_name: str, symbol: str, **extra):
@@ -146,17 +156,150 @@ _ROUTE_TO_VENDOR_IMPORT_SITES = (
 )
 
 
+# patch 引用计数:多个并发深度分析共享同一次安装,第一个进入者保存真
+# route_to_vendor 并装到所有 import site,最后一个退出才恢复。数据隔离靠
+# _PANWATCH_DATA(ContextVar),patch 本身只需进程级安装一次 —— 消除原先
+# "A 退出时把全局恢复成 B 的 _patched"的嵌套竞态。
+_patch_lock = threading.Lock()
+_patch_refcount = 0
+_patch_saved_sites: list[tuple[Any, str, Any]] = []  # (module, attr_name, original_value)
+_real_route_to_vendor = None  # 真 route_to_vendor(走上游 vendor 时用)
+
+
+def _patched_route_to_vendor(method_name: str, *args, **kwargs):
+    """模块级无状态 patch:A 股走 PanWatch(读 _cache()),港股先试上游再兜底,其余放行。
+
+    与上游 route_to_vendor(method, *args, **kwargs) 完全同签名。上游所有 toolkit
+    都用 positional 传 ticker:
+      route_to_vendor("get_fundamentals", ticker, curr_date)
+      route_to_vendor("get_news", ticker, start_date, end_date)
+      route_to_vendor("get_stock_data", symbol, ...)
+      route_to_vendor("get_global_news", curr_date, look_back_days, limit)  # 无 symbol
+
+    无任何实例状态:symbol 来自调用参数,数据来自 _cache()(当前 context),
+    所以多个并发任务共享同一个 _patched 也不会串台。
+    """
+    symbol = ""
+    # 大多数 method 第一个 positional 就是 ticker/symbol(get_global_news 等例外)
+    if args and isinstance(args[0], str) and not args[0][:4].isdigit():
+        # 第一个参数是 ticker(601127)而非日期(2026-...)
+        if not (len(args[0]) >= 8 and args[0][4] in "-/"):
+            symbol = args[0]
+    # 兜底:再看 kwargs
+    if not symbol:
+        symbol = kwargs.get("symbol") or kwargs.get("ticker") or ""
+
+    # 没拿到 symbol 时(如 get_global_news),用 cache 里的标的兜底,
+    # 拦截"全局新闻"类调用避免拉到无关 Yahoo 鞋类/汽油新闻。
+    if not symbol:
+        cached_stock = _cache().get("stock")
+        cached_symbol = getattr(cached_stock, "symbol", "") if cached_stock else ""
+        if is_panwatch_routable(cached_symbol):
+            symbol = cached_symbol
+
+    # A 股:yfinance/finnhub 拉不到,直接走 PanWatch
+    if is_a_share(symbol) and _cache():
+        try:
+            result = _serve_from_panwatch(method_name, symbol, kwargs, args=args)
+            _emit_toolkit_log(
+                "info", "HIT", method_name, symbol,
+                chars=len(result),
+                snippet=str(result)[:4000],
+                source="panwatch",
+                extra_args=_args_summary(args),
+            )
+            return result
+        except NotImplementedError:
+            _emit_toolkit_log(
+                "info", "MISS", method_name, symbol,
+                reason="PanWatch 未实现该 method,放行到上游",
+            )
+        except Exception as e:
+            _emit_toolkit_log("warning", "ERROR", method_name, symbol, error=str(e)[:200])
+            return f"[PanWatch error: {e}]"
+
+    # 港股:先把 ticker 转成 yfinance 格式(00241 → 0241.HK)试上游,
+    # yfinance 返回有数据就用,无数据(No data found / 极短返回)fallback 到 PanWatch。
+    if is_hk_share(symbol):
+        yf_symbol = hk_symbol_to_yfinance(symbol)
+        new_args = list(args)
+        # 替换第一个 positional ticker(如果它就是当前 symbol)
+        for i, a in enumerate(new_args):
+            if isinstance(a, str) and a == symbol:
+                new_args[i] = yf_symbol
+                break
+        try:
+            upstream_result = _real_route_to_vendor(method_name, *new_args, **kwargs)
+        except Exception as e:
+            upstream_result = ""
+            logger.warning(f"[TA toolkit] HK upstream {method_name}({yf_symbol}) 失败: {e}")
+        upstream_str = str(upstream_result) if upstream_result is not None else ""
+
+        if _yfinance_response_has_data(upstream_str):
+            # 走上游 vendor 拿到数据 = PASSTHROUGH,只是 source 标记转格式
+            _emit_toolkit_log(
+                "info", "PASSTHROUGH", method_name, symbol,
+                chars=len(upstream_str),
+                snippet=upstream_str[:4000],
+                source=f"upstream HK(→{yf_symbol})",
+                extra_args=_args_summary(args),
+            )
+            return upstream_result
+
+        # yfinance 没数据 → fallback 到 PanWatch = HIT(PanWatch 兜底提供数据)
+        if _cache():
+            try:
+                result = _serve_from_panwatch(method_name, symbol, kwargs, args=args)
+                _emit_toolkit_log(
+                    "info", "HIT", method_name, symbol,
+                    chars=len(result),
+                    snippet=str(result)[:4000],
+                    source="panwatch HK fallback",
+                    extra_args=_args_summary(args),
+                )
+                return result
+            except NotImplementedError:
+                pass
+            except Exception as e:
+                _emit_toolkit_log("warning", "ERROR", method_name, symbol, error=str(e)[:200])
+                return f"[PanWatch error: {e}]"
+        # 港股两边都没 = ERROR
+        _emit_toolkit_log(
+            "warning", "ERROR", method_name, symbol,
+            chars=len(upstream_str), snippet=upstream_str[:4000],
+            source=f"upstream HK(→{yf_symbol}) + panwatch 均空",
+            error="HK no data from either source",
+        )
+        return upstream_result
+
+    # 美股 / 其他:直接走上游 vendor
+    upstream_result = _real_route_to_vendor(method_name, *args, **kwargs)
+    upstream_str = str(upstream_result) if upstream_result is not None else ""
+    action_label = "PASSTHROUGH" if not is_a_share(symbol) else "FALLTHROUGH"
+    _emit_toolkit_log(
+        "info", action_label, method_name, symbol or "(none)",
+        chars=len(upstream_str),
+        snippet=upstream_str[:4000],
+        source="upstream",
+        extra_args=_args_summary(args),
+    )
+    return upstream_result
+
+
 @contextmanager
 def patch_route_to_vendor():
     """Monkeypatch tradingagents.dataflows.interface.route_to_vendor + 所有 import sites。
 
-    当请求 A 股代码时,从 _PANWATCH_DATA_CACHE 返回 PanWatch 已拉的数据。
+    当请求 A 股代码时,从 _PANWATCH_DATA(当前 context)返回 PanWatch 已拉的数据。
     非 A 股放行到原函数。
 
-    退出时恢复原函数。**幂等**:多次进入互不影响。
+    引用计数 + 锁:并发的多个深度分析共享同一次安装,第一个进入者装、最后一个
+    退出才卸载,_real_route_to_vendor 永远保存真函数 —— 消除嵌套 patch 链错乱。
 
     如果 tradingagents 库未安装,本 context manager 是 no-op,不抛异常。
     """
+    global _patch_refcount, _real_route_to_vendor
+
     try:
         from tradingagents.dataflows import interface as ta_interface
     except ImportError:
@@ -172,146 +315,37 @@ def patch_route_to_vendor():
         yield
         return
 
-    original = ta_interface.route_to_vendor
-
-    def _patched(method_name: str, *args, **kwargs):
-        """与上游 route_to_vendor(method, *args, **kwargs) 完全同签名。
-
-        上游所有 toolkit 都用 positional 传 ticker:
-          route_to_vendor("get_fundamentals", ticker, curr_date)
-          route_to_vendor("get_news", ticker, start_date, end_date)
-          route_to_vendor("get_stock_data", symbol, ...)
-          route_to_vendor("get_global_news", curr_date, look_back_days, limit)  # 无 symbol
-        """
-        symbol = ""
-        # 大多数 method 第一个 positional 就是 ticker/symbol(get_global_news 等例外)
-        if args and isinstance(args[0], str) and not args[0][:4].isdigit():
-            # 第一个参数是 ticker(601127)而非日期(2026-...)
-            if not (len(args[0]) >= 8 and args[0][4] in "-/"):
-                symbol = args[0]
-        # 兜底:再看 kwargs
-        if not symbol:
-            symbol = kwargs.get("symbol") or kwargs.get("ticker") or ""
-
-        # 没拿到 symbol 时(如 get_global_news),用 cache 里的标的兜底,
-        # 拦截"全局新闻"类调用避免拉到无关 Yahoo 鞋类/汽油新闻。
-        if not symbol:
-            cached_stock = _PANWATCH_DATA_CACHE.get("stock")
-            cached_symbol = getattr(cached_stock, "symbol", "") if cached_stock else ""
-            if is_panwatch_routable(cached_symbol):
-                symbol = cached_symbol
-
-        # A 股:yfinance/finnhub 拉不到,直接走 PanWatch
-        if is_a_share(symbol) and _PANWATCH_DATA_CACHE:
-            try:
-                result = _serve_from_panwatch(method_name, symbol, kwargs, args=args)
-                _emit_toolkit_log(
-                    "info", "HIT", method_name, symbol,
-                    chars=len(result),
-                    snippet=str(result)[:4000],
-                    source="panwatch",
-                    extra_args=_args_summary(args),
-                )
-                return result
-            except NotImplementedError:
-                _emit_toolkit_log(
-                    "info", "MISS", method_name, symbol,
-                    reason="PanWatch 未实现该 method,放行到上游",
-                )
-            except Exception as e:
-                _emit_toolkit_log("warning", "ERROR", method_name, symbol, error=str(e)[:200])
-                return f"[PanWatch error: {e}]"
-
-        # 港股:先把 ticker 转成 yfinance 格式(00241 → 0241.HK)试上游,
-        # yfinance 返回有数据就用,无数据(No data found / 极短返回)fallback 到 PanWatch。
-        if is_hk_share(symbol):
-            yf_symbol = hk_symbol_to_yfinance(symbol)
-            new_args = list(args)
-            # 替换第一个 positional ticker(如果它就是当前 symbol)
-            for i, a in enumerate(new_args):
-                if isinstance(a, str) and a == symbol:
-                    new_args[i] = yf_symbol
-                    break
-            try:
-                upstream_result = original(method_name, *new_args, **kwargs)
-            except Exception as e:
-                upstream_result = ""
-                logger.warning(f"[TA toolkit] HK upstream {method_name}({yf_symbol}) 失败: {e}")
-            upstream_str = str(upstream_result) if upstream_result is not None else ""
-
-            if _yfinance_response_has_data(upstream_str):
-                # 走上游 vendor 拿到数据 = PASSTHROUGH,只是 source 标记转格式
-                _emit_toolkit_log(
-                    "info", "PASSTHROUGH", method_name, symbol,
-                    chars=len(upstream_str),
-                    snippet=upstream_str[:4000],
-                    source=f"upstream HK(→{yf_symbol})",
-                    extra_args=_args_summary(args),
-                )
-                return upstream_result
-
-            # yfinance 没数据 → fallback 到 PanWatch = HIT(PanWatch 兜底提供数据)
-            if _PANWATCH_DATA_CACHE:
-                try:
-                    result = _serve_from_panwatch(method_name, symbol, kwargs, args=args)
-                    _emit_toolkit_log(
-                        "info", "HIT", method_name, symbol,
-                        chars=len(result),
-                        snippet=str(result)[:4000],
-                        source="panwatch HK fallback",
-                        extra_args=_args_summary(args),
-                    )
-                    return result
-                except NotImplementedError:
-                    pass
-                except Exception as e:
-                    _emit_toolkit_log("warning", "ERROR", method_name, symbol, error=str(e)[:200])
-                    return f"[PanWatch error: {e}]"
-            # 港股两边都没 = ERROR
-            _emit_toolkit_log(
-                "warning", "ERROR", method_name, symbol,
-                chars=len(upstream_str), snippet=upstream_str[:4000],
-                source=f"upstream HK(→{yf_symbol}) + panwatch 均空",
-                error="HK no data from either source",
-            )
-            return upstream_result
-
-        # 美股 / 其他:直接走上游 vendor
-        upstream_result = original(method_name, *args, **kwargs)
-        upstream_str = str(upstream_result) if upstream_result is not None else ""
-        action_label = "PASSTHROUGH" if not is_a_share(symbol) else "FALLTHROUGH"
-        _emit_toolkit_log(
-            "info", action_label, method_name, symbol or "(none)",
-            chars=len(upstream_str),
-            snippet=upstream_str[:4000],
-            source="upstream",
-            extra_args=_args_summary(args),
-        )
-        return upstream_result
-
-    # 同时 patch 源头模块属性 + 所有 import sites 的命名空间引用
-    # (`from ... import route_to_vendor` 是 import-time binding,只 patch
-    # 源头不够 — 工具模块持有的原引用不变)
     import importlib
-    patched_sites: list[tuple[Any, str, Any]] = []  # (module, attr_name, original_value)
-    ta_interface.route_to_vendor = _patched
-    patched_sites.append((ta_interface, "route_to_vendor", original))
-
-    for module_path in _ROUTE_TO_VENDOR_IMPORT_SITES:
-        try:
-            mod = importlib.import_module(module_path)
-        except ImportError:
-            continue
-        if hasattr(mod, "route_to_vendor"):
-            patched_sites.append((mod, "route_to_vendor", mod.route_to_vendor))
-            mod.route_to_vendor = _patched
-            logger.debug(f"[TA toolkit] patched route_to_vendor in {module_path}")
+    with _patch_lock:
+        if _patch_refcount == 0:
+            # 第一个进入者:保存真函数并装到源头 + 所有 import sites
+            # (`from ... import route_to_vendor` 是 import-time binding,只 patch
+            # 源头不够 — 工具模块持有的原引用不变)
+            _real_route_to_vendor = ta_interface.route_to_vendor
+            _patch_saved_sites.clear()
+            ta_interface.route_to_vendor = _patched_route_to_vendor
+            _patch_saved_sites.append((ta_interface, "route_to_vendor", _real_route_to_vendor))
+            for module_path in _ROUTE_TO_VENDOR_IMPORT_SITES:
+                try:
+                    mod = importlib.import_module(module_path)
+                except ImportError:
+                    continue
+                if hasattr(mod, "route_to_vendor"):
+                    _patch_saved_sites.append((mod, "route_to_vendor", mod.route_to_vendor))
+                    mod.route_to_vendor = _patched_route_to_vendor
+                    logger.debug(f"[TA toolkit] patched route_to_vendor in {module_path}")
+        _patch_refcount += 1
 
     try:
         yield
     finally:
-        for mod, attr, orig in patched_sites:
-            setattr(mod, attr, orig)
+        with _patch_lock:
+            _patch_refcount -= 1
+            if _patch_refcount <= 0:
+                _patch_refcount = 0
+                for mod, attr, orig in _patch_saved_sites:
+                    setattr(mod, attr, orig)
+                _patch_saved_sites.clear()
 
 
 def _args_summary(args: tuple) -> str:
@@ -338,8 +372,8 @@ def _stock_meta_header(symbol: str) -> str:
     A 股 ticker 不在 yfinance/finnhub 数据集,LLM 不能从 ticker 反查公司名,
     必须显式告诉它"601127 = 赛力斯",否则会瞎编(如把 601127 当中国平安)。
     """
-    stock = _PANWATCH_DATA_CACHE.get("stock")
-    quote = _PANWATCH_DATA_CACHE.get("quote") or {}
+    stock = _cache().get("stock")
+    quote = _cache().get("quote") or {}
 
     name = ""
     market = "CN"
@@ -378,7 +412,7 @@ def _stock_meta_header(symbol: str) -> str:
 
 
 def _serve_from_panwatch(method_name: str, symbol: str, kwargs: dict, args: tuple = ()) -> str:
-    """从 _PANWATCH_DATA_CACHE 构造 TradingAgents 期望的数据格式(CSV / JSON 字符串)。
+    """从 _cache()(当前 context 的数据)构造 TradingAgents 期望的数据格式(CSV / JSON 字符串)。
 
     上游各 vendor 方法返回类型不一,通常是 str(已格式化的 CSV/表格/JSON)。
     本函数尽量兼容常见 method_name。**未识别的 method 返回空串,触发上游默认 vendor。**
@@ -396,7 +430,7 @@ def _serve_from_panwatch(method_name: str, symbol: str, kwargs: dict, args: tupl
             indicator = str(args[1]).lower()
             return f"{header}\n\n{_render_single_indicator(indicator, symbol)}"
         # 没传 indicator 参数:降级到 K 线 CSV
-        klines = _PANWATCH_DATA_CACHE.get("klines") or []
+        klines = _cache().get("klines") or []
         if klines:
             return f"{header}\n\n{_klines_to_csv(klines)}"
         return f"{header}\n\n[No data available for indicators on {symbol}]"
@@ -405,14 +439,14 @@ def _serve_from_panwatch(method_name: str, symbol: str, kwargs: dict, args: tupl
     if any(k in method for k in (
         "stockstats", "yfin", "ohlcv", "kline", "price", "stock_data",
     )):
-        klines = _PANWATCH_DATA_CACHE.get("klines") or []
+        klines = _cache().get("klines") or []
         if klines:
             return f"{header}\n\n{_klines_to_csv(klines)}"
         return f"{header}\n\n[No kline data available from PanWatch for {symbol}]"
 
     # 2) 公告/事件/新闻:get_finnhub_news / get_news / get_events / get_global_news / get_insider_*
     if any(k in method for k in ("news", "event", "announce", "insider")):
-        events = _PANWATCH_DATA_CACHE.get("events") or []
+        events = _cache().get("events") or []
         if events:
             return f"{header}\n\n{_events_to_text(events, limit=20)}"
         return (
@@ -423,13 +457,13 @@ def _serve_from_panwatch(method_name: str, symbol: str, kwargs: dict, args: tupl
 
     # 3) 资金流(主力资金净流入)— 注意:不要匹配 "cashflow" / "cash_flow",那是现金流量表
     if "capital" in method or ("flow" in method and "cash" not in method):
-        flow = _PANWATCH_DATA_CACHE.get("capital_flow")
+        flow = _cache().get("capital_flow")
         if flow:
             return f"{header}\n\n{_flow_to_text(flow)}"
         return f"{header}\n\n[No capital flow data available for {symbol}]"
 
     # 4) 基本面 / 财报:有真实 akshare 财务数据时返回完整指标,否则 fallback 到 quote
-    financial = _PANWATCH_DATA_CACHE.get("financial")
+    financial = _cache().get("financial")
     if "fundamental" in method or "financial" in method:
         if financial:
             from src.agents.tradingagents.financial_data import render_fundamentals_summary
@@ -469,10 +503,10 @@ def _render_single_indicator(indicator: str, symbol: str) -> str:
 
     数据源:KlineCollector.get_technical_indicators 已经算好的 dataclass。
     """
-    tech = _PANWATCH_DATA_CACHE.get("technical")
+    tech = _cache().get("technical")
     if not tech:
         # 没预计算时,fallback 到 K 线 CSV(让 LLM 自己算)
-        klines = _PANWATCH_DATA_CACHE.get("klines") or []
+        klines = _cache().get("klines") or []
         if klines:
             return (
                 f"[Indicator query: {indicator}] (no precomputed value, "
@@ -546,7 +580,7 @@ def _render_single_indicator(indicator: str, symbol: str) -> str:
 
 def _quote_to_lightweight_fundamentals(symbol: str) -> str:
     """从 quote 拉"轻量基本面"(市值/PE/换手率/成交额),给 LLM 一些真实数据。"""
-    quote = _PANWATCH_DATA_CACHE.get("quote") or {}
+    quote = _cache().get("quote") or {}
     if not isinstance(quote, dict):
         return f"[No lightweight fundamentals available for {symbol}]"
 

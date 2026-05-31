@@ -119,6 +119,50 @@ def test_decision_unrecognized_then_text_has_underweight():
 
 
 # ============================================================
+# 正文与上游 decision 冲突:正文为准(生产 bug 回归)
+# 上游 propagate 二次提炼出 "HOLD",但 PM 正文白纸黑字写"卖出/买入",
+# 必须以正文为准,否则顶部显示"持有"但正文是"卖出"(数据不一致)。
+# ============================================================
+
+def test_text_sell_overrides_decision_hold():
+    """生产 bug:decision=Hold 但正文'最终交易决策:卖出/Sell' → 必须 sell(正文优先)"""
+    text = (
+        "作为投资组合经理,我综合了风险分析师的辩论...\n\n"
+        "## 最终交易决策: **卖出**\n\n### 评级: **Sell**\n\n核心依据..."
+    )
+    r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
+    assert r.raw_data["suggestion"]["action"] == "sell"
+    assert r.raw_data["suggestion"]["action_label"] == "卖出"
+    assert r.raw_data["suggestion"]["rating_raw"] == "sell"
+
+
+def test_text_buy_overrides_decision_hold():
+    """decision=Hold 但正文'评级:买入' → buy(正文优先)"""
+    text = "总之,广汽集团具备投资价值。\n\n最终交易决策: **买入**\n评级: 买入"
+    r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
+    assert r.raw_data["suggestion"]["action"] == "buy"
+    assert r.raw_data["suggestion"]["action_label"] == "买入"
+
+
+def test_decision_used_when_text_has_no_label():
+    """正文没有显式评级标签 → 回退信任上游 decision(此处 Hold)"""
+    text = "市场存在不确定性,建议观察。维持观望立场,等待更明确信号。"
+    r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
+    assert r.raw_data["suggestion"]["action"] == "hold"
+    assert r.raw_data["suggestion"]["rating_raw"] == "hold"
+
+
+def test_text_label_not_confused_by_distractor_words():
+    """正文含干扰词(否决了'买入')但显式标签是'卖出' → 标签优先,sell 而非 buy"""
+    text = (
+        "我否决了多头分析师的**买入**建议,理由是基本面恶化。\n\n"
+        "FINAL TRANSACTION PROPOSAL: **SELL**"
+    )
+    r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
+    assert r.raw_data["suggestion"]["action"] == "sell"
+
+
+# ============================================================
 # Markdown 渲染:5 档评级标签写进 markdown 头部
 # ============================================================
 

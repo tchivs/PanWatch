@@ -55,11 +55,16 @@ def map_state_to_result(
     state = ta_result.get("final_state") or {}
     cost_usd = float(ta_result.get("cost_usd", 0.0) or 0.0)
 
-    # 上游 PM 返回 5 档评级("Buy"/"Overweight"/"Hold"/"Underweight"/"Sell")
-    # 如果 propagate() 第二个返回拿不到 5 档值,从 final_trade_decision 文本里 fallback 解析
-    rating_raw = (ta_result.get("decision") or "").strip().lower()
+    # 评级以 PM 正文(final_trade_decision,用户实际看到的最终决策书)为权威来源:
+    # 上游 propagate() 第二个返回的 decision 是对正文的二次提炼,会失真(正文写"卖出"
+    # 却返回 "HOLD"),所以优先解析正文里的显式评级标签。
+    # 优先级:正文显式标签 > 上游 decision > 正文模糊扫描兜底。
+    final_text = state.get("final_trade_decision") or ""
+    rating_raw = _parse_rating_label(final_text)
     if rating_raw not in RATING_LABEL_MAP:
-        rating_raw = _parse_rating_from_text(state.get("final_trade_decision") or "")
+        rating_raw = (ta_result.get("decision") or "").strip().lower()
+    if rating_raw not in RATING_LABEL_MAP:
+        rating_raw = _parse_rating_from_text(final_text)
 
     action = RATING_ACTION_MAP.get(rating_raw, "hold")
     action_label = RATING_LABEL_MAP.get(rating_raw, "持有")
@@ -120,8 +125,12 @@ _RATING_ZH_TO_EN = {
 }
 
 
-def _parse_rating_from_text(text: str) -> str:
-    """从文本里抽 5 档评级。优先 'Rating: X' 标签,然后第一个 5 档词。"""
+def _parse_rating_label(text: str) -> str:
+    """只解析 PM 正文里的**显式评级标签**(最终交易决策/评级/FINAL TRANSACTION PROPOSAL: X)。
+
+    不做模糊关键词扫描 —— 避免正文里"否决了之前的买入建议"这类干扰词被误判。
+    用作评级提取的首选,确保展示与用户可见的最终决策书一致。
+    """
     if not text:
         return ""
     m = _RATING_TEXT_RE.search(text)
@@ -131,6 +140,16 @@ def _parse_rating_from_text(text: str) -> str:
             word = _RATING_ZH_TO_EN[word]
         if word in RATING_LABEL_MAP:
             return word
+    return ""
+
+
+def _parse_rating_from_text(text: str) -> str:
+    """从文本里抽 5 档评级。优先 'Rating: X' 标签,然后第一个 5 档词。"""
+    if not text:
+        return ""
+    label = _parse_rating_label(text)
+    if label:
+        return label
     # 兜底:扫描整段文本里第一个出现的 5 档英文/中文词
     text_low = text.lower()
     for word in ("overweight", "underweight", "buy", "sell", "hold"):
