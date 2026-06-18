@@ -76,6 +76,21 @@ def _clear_market_caches():
     _clear()
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_db_schema():
+    """确保真实 DB 引擎已建表。
+
+    少数用例直接用 SessionLocal 传给 async 接口(只读查询),CI 全新环境的
+    data/panwatch.db 无表会报 'no such table: stocks'。这里在会话开始时幂等建表
+    (本地已有表则无副作用),与各用例自建的内存库互不影响。
+    """
+    from src.web import models  # noqa: F401  注册所有 ORM 模型到 Base.metadata
+    from src.web.database import Base, engine
+
+    Base.metadata.create_all(engine)
+    yield
+
+
 # ---------------------------------------------------------------------------
 # 共用工厂 fixtures
 # ---------------------------------------------------------------------------
