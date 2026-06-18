@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { RefreshCw, AlertTriangle, Sparkles, Activity, ShieldAlert, Layers } from 'lucide-react'
+import { RefreshCw, AlertTriangle, Sparkles, Activity, ShieldAlert } from 'lucide-react'
 import {
   dashboardApi,
-  discoveryApi,
   portfolioApi,
   recommendationsApi,
   type DashboardMarketIndex,
@@ -11,12 +10,11 @@ import {
   type PortfolioDiagnostics,
   type PortfolioBenchmark,
   type StrategySignalItem,
-  type HotBoardItem,
-  type HotStockItem,
 } from '@panwatch/api'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Onboarding } from '@panwatch/biz-ui/components/onboarding'
 import StockInsightModal from '@panwatch/biz-ui/components/stock-insight-modal'
+import DiscoveryPanel from '@/components/DiscoveryPanel'
 
 function pct(v?: number | null, digits = 2): string {
   if (v == null || !isFinite(v)) return '--'
@@ -44,10 +42,6 @@ export default function DashboardPage() {
   const [diag, setDiag] = useState<PortfolioDiagnostics | null>(null)
   const [bench, setBench] = useState<PortfolioBenchmark | null>(null)
   const [oppFallback, setOppFallback] = useState<StrategySignalItem[]>([])
-  const [boardMarket, setBoardMarket] = useState<'CN' | 'HK' | 'US'>('CN')
-  const [boards, setBoards] = useState<HotBoardItem[]>([])
-  const [expandedBoard, setExpandedBoard] = useState<string | null>(null)
-  const [boardStocks, setBoardStocks] = useState<HotStockItem[]>([])
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [modal, setModal] = useState<{ open: boolean; symbol: string; market: string; name: string; hasPosition: boolean }>({
     open: false,
@@ -87,40 +81,12 @@ export default function DashboardPage() {
     if (!localStorage.getItem('panwatch_onboarding_completed')) setShowOnboarding(true)
   }, [load])
 
-  const loadBoards = useCallback(async (market: 'CN' | 'HK' | 'US') => {
-    try {
-      setBoards((await discoveryApi.listHotBoards({ market, mode: 'gainers', limit: 9 })) || [])
-    } catch {
-      setBoards([])
-    }
-  }, [])
-
-  useEffect(() => {
-    loadBoards(boardMarket)
-    setExpandedBoard(null)
-    setBoardStocks([])
-  }, [boardMarket, loadBoards])
-
-  const clickBoard = async (code: string) => {
-    if (expandedBoard === code) {
-      setExpandedBoard(null)
-      return
-    }
-    setExpandedBoard(code)
-    setBoardStocks([])
-    try {
-      setBoardStocks((await discoveryApi.listBoardStocks(code, { mode: 'gainers', limit: 6 })) || [])
-    } catch {
-      setBoardStocks([])
-    }
-  }
-
   const handleOnboardingComplete = () => {
     localStorage.setItem('panwatch_onboarding_completed', 'true')
     setShowOnboarding(false)
   }
 
-  const openStock = (symbol: string, market: string, name: string, hasPosition = false) =>
+  const openStock = (symbol: string, market: string, name = '', hasPosition = false) =>
     setModal({ open: true, symbol, market: market || 'CN', name, hasPosition })
 
   // 今日要紧事:持仓异动 + 触发的盯盘信号(有 AI 建议/告警优先)
@@ -296,64 +262,7 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* 热门板块 */}
-      <div className="card mt-3 p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Layers className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">热门板块</h2>
-          </div>
-          <div className="flex gap-1">
-            {(['CN', 'HK', 'US'] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setBoardMarket(m)}
-                className={`rounded px-2 py-0.5 text-[11px] ${
-                  boardMarket === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'
-                }`}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        </div>
-        {boards.length === 0 ? (
-          <div className="py-4 text-center text-[12px] text-muted-foreground">{loading ? '加载中…' : '暂无板块数据'}</div>
-        ) : (
-          <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2 md:grid-cols-3">
-            {boards.map((b) => (
-              <div key={b.code}>
-                <div
-                  className="flex cursor-pointer items-center justify-between py-1 hover:bg-accent/30"
-                  onClick={() => clickBoard(b.code)}
-                >
-                  <span className="truncate text-[12px]">{b.name}</span>
-                  <span className={`font-mono text-[12px] ${moveColor(b.change_pct)}`}>{pct(b.change_pct)}</span>
-                </div>
-                {expandedBoard === b.code && (
-                  <div className="mb-1 ml-1 border-l border-border/40 pl-2">
-                    {boardStocks.length === 0 ? (
-                      <div className="py-1 text-[11px] text-muted-foreground">加载中…</div>
-                    ) : (
-                      boardStocks.map((s) => (
-                        <div
-                          key={`${s.market}:${s.symbol}`}
-                          className="flex cursor-pointer items-center justify-between py-0.5 hover:bg-accent/30"
-                          onClick={() => openStock(s.symbol, s.market, s.name)}
-                        >
-                          <span className="truncate text-[11px]">{s.name}</span>
-                          <span className={`font-mono text-[11px] ${moveColor(s.change_pct)}`}>{pct(s.change_pct)}</span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      <DiscoveryPanel monitorStocks={scan} onOpenStock={openStock} />
 
       <StockInsightModal
         open={modal.open}
