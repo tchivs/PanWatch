@@ -99,6 +99,21 @@ def list_settings(db: Session = Depends(get_db)):
     return result
 
 
+AVATAR_KEY = "ui_avatar"
+
+
+@router.get("/avatar")
+def get_avatar(db: Session = Depends(get_db)):
+    """读取用户头像(data URL 或图片地址)。
+
+    头像通过通用 PUT /settings/{AVATAR_KEY} 写入(走 catch-all,不依赖路由注册顺序),
+    这里单独读取,避免大 base64 混进通用设置列表。GET /avatar 无 /{key} 同名 GET,
+    不存在路由抢匹配问题。
+    """
+    row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
+    return {"value": (row.value if row and row.value else "")}
+
+
 @router.put("/{key}", response_model=SettingResponse)
 def update_setting(key: str, update: SettingUpdate, db: Session = Depends(get_db)):
     setting = db.query(AppSettings).filter(AppSettings.key == key).first()
