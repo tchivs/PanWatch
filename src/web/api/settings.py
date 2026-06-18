@@ -1,5 +1,6 @@
+import base64
 import os
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -99,19 +100,82 @@ def list_settings(db: Session = Depends(get_db)):
     return result
 
 
-AVATAR_KEY = "ui_avatar"
+AVATAR_KEY = "ui_avatar"  # DB 仅存文件名;图片本体落在 data/avatars/
+
+
+def _avatar_dir() -> str:
+    d = os.path.join(os.environ.get("DATA_DIR", "./data"), "avatars")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 @router.get("/avatar")
 def get_avatar(db: Session = Depends(get_db)):
-    """读取用户头像(data URL 或图片地址)。
+    """读取用户头像:DB 存文件名,图片本体在 data/avatars/,读取后以 data URL 返回。
 
-    头像通过通用 PUT /settings/{AVATAR_KEY} 写入(走 catch-all,不依赖路由注册顺序),
-    这里单独读取,避免大 base64 混进通用设置列表。GET /avatar 无 /{key} 同名 GET,
-    不存在路由抢匹配问题。
+    GET /avatar 无同名 GET /{key},不存在路由抢匹配问题。
     """
     row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
-    return {"value": (row.value if row and row.value else "")}
+    fname = (row.value if row and row.value else "").strip()
+    if not fname:
+        return {"value": ""}
+    path = os.path.join(_avatar_dir(), fname)
+    if not os.path.isfile(path):
+        return {"value": ""}
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {"value": ""}
+    mime = "image/png" if fname.lower().endswith(".png") else "image/jpeg"
+    return {"value": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"}
+
+
+@router.put("/avatar")
+def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
+    """保存/清空用户头像:把 data URL 落成 data/avatars/avatar.* 文件,DB 仅记文件名。
+
+    需在 /{key} 之前注册以优先匹配。传空字符串即清空(删文件 + 清记录)。
+    """
+    row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
+    old = (row.value if row else "") or ""
+    value = (update.value or "").strip()
+
+    if not value:
+        if old:
+            try:
+                os.remove(os.path.join(_avatar_dir(), old))
+            except OSError:
+                pass
+        if row:
+            row.value = ""
+        db.commit()
+        return {"value": ""}
+
+    if not (value.startswith("data:") and "," in value):
+        raise HTTPException(400, "头像需为 data URL")
+    header, b64 = value.split(",", 1)
+    ext = "png" if "image/png" in header else "jpg"
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(400, "头像数据无效")
+
+    fname = f"avatar.{ext}"
+    with open(os.path.join(_avatar_dir(), fname), "wb") as f:
+        f.write(raw)
+    if old and old != fname:  # 扩展名变化时清掉旧文件
+        try:
+            os.remove(os.path.join(_avatar_dir(), old))
+        except OSError:
+            pass
+    if not row:
+        row = AppSettings(key=AVATAR_KEY, value=fname, description="用户头像文件名")
+        db.add(row)
+    else:
+        row.value = fname
+    db.commit()
+    return {"value": fname}
 
 
 @router.put("/{key}", response_model=SettingResponse)
