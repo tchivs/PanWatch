@@ -140,36 +140,57 @@ async def _guard(coro, fallback: dict) -> dict:
                      "fail", 0, str(e))
 
 
-async def run_selfcheck(*, db=None, notify_send: bool = False) -> dict:
-    """枚举所有启用的 数据源/AI模型/通知渠道,并发探测,返回看板。"""
+def _enumerate(db) -> list[dict]:
+    """枚举所有启用的待检项(身份 + ORM 引用),不探测。"""
+    from src.web.models import AIModel, AIService, DataSource, NotifyChannel
+
+    targets: list[dict] = []
+    for src in db.query(DataSource).filter(DataSource.enabled.is_(True)).all():
+        targets.append({"category": "datasource", "key": f"ds:{src.id}", "name": src.name,
+                        "_kind": "ds", "_obj": src})
+    for model in db.query(AIModel).all():
+        service = db.query(AIService).filter(AIService.id == model.service_id).first()
+        if not service:
+            continue
+        targets.append({"category": "ai", "key": f"ai:{model.id}", "name": model.name or model.model,
+                        "_kind": "ai", "_obj": model, "_service": service})
+    for ch in db.query(NotifyChannel).filter(NotifyChannel.enabled.is_(True)).all():
+        targets.append({"category": "notify", "key": f"nc:{ch.id}", "name": ch.name or ch.type,
+                        "_kind": "nc", "_obj": ch})
+    return targets
+
+
+def _identity(t: dict) -> dict:
+    return {"category": t["category"], "key": t["key"], "name": t["name"]}
+
+
+def _probe_for(t: dict, notify_send: bool):
+    if t["_kind"] == "ds":
+        return probe_datasource(t["_obj"])
+    if t["_kind"] == "ai":
+        return probe_ai_model(t["_obj"], t["_service"])
+    return probe_notify_channel(t["_obj"], send=notify_send)
+
+
+def list_selfcheck_items(*, db=None) -> list[dict]:
+    """只枚举待检项身份(category/key/name),不探测;供前端先渲染列表再逐项检查。"""
     own = db is None
     db = db or SessionLocal()
     try:
-        from src.web.models import AIModel, AIService, DataSource, NotifyChannel
+        return [_identity(t) for t in _enumerate(db)]
+    finally:
+        if own:
+            db.close()
 
-        tasks: list = []
 
-        for src in db.query(DataSource).filter(DataSource.enabled.is_(True)).all():
-            tasks.append(_guard(
-                probe_datasource(src),
-                {"category": "datasource", "key": f"ds:{src.id}", "name": src.name},
-            ))
-
-        for model in db.query(AIModel).all():
-            service = db.query(AIService).filter(AIService.id == model.service_id).first()
-            if not service:
-                continue
-            tasks.append(_guard(
-                probe_ai_model(model, service),
-                {"category": "ai", "key": f"ai:{model.id}", "name": model.name or model.model},
-            ))
-
-        for ch in db.query(NotifyChannel).filter(NotifyChannel.enabled.is_(True)).all():
-            tasks.append(_guard(
-                probe_notify_channel(ch, send=notify_send),
-                {"category": "notify", "key": f"nc:{ch.id}", "name": ch.name or ch.type},
-            ))
-
+async def run_selfcheck(*, db=None, notify_send: bool = False, keys=None) -> dict:
+    """探测启用项,返回看板。keys 非空时只探测这些 key(供前端逐项更新进度)。"""
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        keyset = set(keys) if keys is not None else None
+        targets = [t for t in _enumerate(db) if keyset is None or t["key"] in keyset]
+        tasks = [_guard(_probe_for(t, notify_send), _identity(t)) for t in targets]
         items = list(await asyncio.gather(*tasks)) if tasks else []
         summary = {
             "total": len(items),
