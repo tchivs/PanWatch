@@ -11,6 +11,8 @@ export interface SelfCheckItem {
   hint: string
   /** 例如通知"仅校验配置未真发"。 */
   note: string | null
+  /** 二级分组(AI 类目=服务商名);其余类目为 null。 */
+  group: string | null
 }
 
 export interface SelfCheckResult {
@@ -31,7 +33,7 @@ export const healthApi = {
 
   /** 只取可自检项清单(不探测,秒回),用于先渲染再逐项检查。 */
   selfcheckList: () =>
-    fetchAPI<{ items: Array<{ category: string; key: string; name: string }> }>(
+    fetchAPI<{ items: Array<{ category: string; key: string; name: string; group: string | null }> }>(
       '/health/selfcheck?list=1',
     ),
 

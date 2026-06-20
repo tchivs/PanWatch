@@ -134,8 +134,29 @@ def test_list_selfcheck_items_no_probe(monkeypatch):
 
         items = selfcheck.list_selfcheck_items(db=db)
         assert {i["key"] for i in items} == {"ds:1", "nc:1"}
-        assert all({"category", "key", "name"} <= set(i) for i in items)
+        assert all({"category", "key", "name", "group"} <= set(i) for i in items)
         assert called["n"] == 0  # 没触发任何探测
+    finally:
+        db.close()
+
+
+def test_list_items_ai_has_service_group():
+    """AI 项带 group=服务商名(供前端「服务商 → 模型」层级)。"""
+    from src.core.selfcheck import list_selfcheck_items
+    from src.web.models import AIModel, AIService
+
+    db = _mem_db()
+    try:
+        svc = AIService(name="DeepSeek", base_url="https://x", api_key="k")
+        db.add(svc)
+        db.flush()
+        db.add(AIModel(name="ds-chat", model="deepseek-chat", service_id=svc.id))
+        db.add(AIModel(name="ds-reasoner", model="deepseek-reasoner", service_id=svc.id))
+        db.commit()
+        items = list_selfcheck_items(db=db)
+        ai = [i for i in items if i["category"] == "ai"]
+        assert len(ai) == 2
+        assert all(i["group"] == "DeepSeek" for i in ai)
     finally:
         db.close()
 

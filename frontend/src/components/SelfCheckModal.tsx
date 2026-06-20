@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { CheckCircle2, AlertTriangle, XCircle, RefreshCw } from 'lucide-react'
+import { CheckCircle2, AlertTriangle, XCircle, RefreshCw, Loader2 } from 'lucide-react'
 import { healthApi, type SelfCheckItem } from '@panwatch/api'
 import {
   Dialog,
@@ -16,23 +16,35 @@ interface SelfCheckModalProps {
   onClose: () => void
 }
 
-type Status = SelfCheckItem['status'] // 'ok' | 'slow' | 'fail'
+type RowStatus = 'checking' | SelfCheckItem['status']
+
+interface CheckRow {
+  category: string
+  key: string
+  name: string
+  group: string | null
+  status: RowStatus
+  latency_ms: number
+  error: string | null
+  hint: string
+  note: string | null
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   datasource: '数据源',
   ai: 'AI模型',
   notify: '通知渠道',
 }
-
-/** 同时在飞的探测请求上限(简单并发池);每出一个结果就追加一行。 */
+const CATEGORY_ORDER = ['datasource', 'ai', 'notify']
 const CONCURRENCY = 4
 
-const STATUS_META: Record<Status, {
+const STATUS_META: Record<RowStatus, {
   label: string
-  variant: 'success' | 'destructive' | 'outline'
+  variant: 'success' | 'destructive' | 'outline' | 'secondary'
   className: string
   Icon: typeof CheckCircle2
 }> = {
+  checking: { label: '检查中', variant: 'secondary', className: 'text-muted-foreground', Icon: Loader2 },
   ok: { label: '通', variant: 'success', className: '', Icon: CheckCircle2 },
   slow: {
     label: '慢',
@@ -43,30 +55,69 @@ const STATUS_META: Record<Status, {
   fail: { label: '断', variant: 'destructive', className: '', Icon: XCircle },
 }
 
-function StatusBadge({ status }: { status: Status }) {
+function StatusBadge({ status }: { status: RowStatus }) {
   const meta = STATUS_META[status]
   const Icon = meta.Icon
   return (
     <Badge variant={meta.variant} className={meta.className}>
-      <Icon className="w-3 h-3" />
+      <Icon className={`w-3 h-3 ${status === 'checking' ? 'animate-spin' : ''}`} />
       {meta.label}
     </Badge>
   )
 }
 
+function ItemRow({ item }: { item: CheckRow }) {
+  return (
+    <div className="rounded-lg bg-background/60 px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <StatusBadge status={item.status} />
+          <span className="truncate text-[12px] font-medium text-foreground">{item.name}</span>
+        </div>
+        <span className="flex-shrink-0 font-mono text-[11px] text-muted-foreground">
+          {item.status === 'checking' ? '…' : `${item.latency_ms}ms`}
+        </span>
+      </div>
+      {item.status === 'fail' && (
+        <div className="mt-1.5 space-y-1">
+          {item.error && (
+            <p className="truncate text-[11px] text-muted-foreground/70" title={item.error}>
+              {item.error}
+            </p>
+          )}
+          {item.hint && <p className="text-[11px] font-medium text-rose-600">{item.hint}</p>}
+        </div>
+      )}
+      {item.status !== 'fail' && item.status !== 'checking' && item.note && (
+        <p className="mt-1.5 text-[11px] text-muted-foreground/70">{item.note}</p>
+      )}
+    </div>
+  )
+}
+
+/** 按服务商(group)分组,保留出现顺序。 */
+function groupByService(rows: CheckRow[]): Array<[string, CheckRow[]]> {
+  const map = new Map<string, CheckRow[]>()
+  for (const r of rows) {
+    const svc = r.group || '未分组'
+    if (!map.has(svc)) map.set(svc, [])
+    map.get(svc)!.push(r)
+  }
+  return Array.from(map.entries())
+}
+
 export default function SelfCheckModal({ open, onClose }: SelfCheckModalProps) {
-  // rows 只放「已出结果」的项,逐个追加(出来一个显示一个);total 来自清单,用于进度。
-  const [rows, setRows] = useState<SelfCheckItem[]>([])
-  const [total, setTotal] = useState(0)
+  // 先按清单渲染分组骨架(检查中),每项出结果就回填它的状态。
+  const [rows, setRows] = useState<CheckRow[]>([])
   const [running, setRunning] = useState(false)
   const [notifySend, setNotifySend] = useState(false)
   const [listError, setListError] = useState('')
-  // 自增运行序号:切换/重跑时让上一轮在飞的请求结果作废。
   const runIdRef = useRef(0)
 
+  const total = rows.length
   const okCount = rows.filter((r) => r.status === 'ok' || r.status === 'slow').length
   const failCount = rows.filter((r) => r.status === 'fail').length
-  const done = rows.length
+  const done = rows.filter((r) => r.status !== 'checking').length
   const progress = total === 0 ? 0 : Math.round((done / total) * 100)
   const finished = !running && total > 0 && done >= total
 
@@ -75,10 +126,8 @@ export default function SelfCheckModal({ open, onClose }: SelfCheckModalProps) {
     setRunning(true)
     setListError('')
     setRows([])
-    setTotal(0)
 
-    // 1) 先取待检清单(不探测),拿到 total。
-    let items: Array<{ category: string; key: string; name: string }>
+    let items: Array<{ category: string; key: string; name: string; group: string | null }>
     try {
       const res = await healthApi.selfcheckList()
       items = res.items || []
@@ -89,58 +138,84 @@ export default function SelfCheckModal({ open, onClose }: SelfCheckModalProps) {
       return
     }
     if (runId !== runIdRef.current) return
-    setTotal(items.length)
-    if (items.length === 0) {
+
+    const skeleton: CheckRow[] = items.map((it) => ({
+      category: it.category, key: it.key, name: it.name, group: it.group,
+      status: 'checking', latency_ms: 0, error: null, hint: '', note: null,
+    }))
+    setRows(skeleton)
+    if (skeleton.length === 0) {
       setRunning(false)
       return
     }
 
-    // 2) ≤CONCURRENCY 并发逐项探测,每出一个结果就 append 一行。
     let cursor = 0
-    const append = (row: SelfCheckItem) => {
+    const merge = (key: string, patch: Partial<CheckRow>) => {
       if (runId !== runIdRef.current) return
-      setRows((prev) => [...prev, row])
+      setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...patch } : r)))
     }
     const worker = async () => {
       while (true) {
         if (runId !== runIdRef.current) return
         const idx = cursor++
-        if (idx >= items.length) return
-        const it = items[idx]
+        if (idx >= skeleton.length) return
+        const it = skeleton[idx]
         try {
           const res = await healthApi.selfcheckKeys([it.key], notifySend)
           const probed = res.items?.[0]
-          append(probed ?? {
-            category: it.category as SelfCheckItem['category'], key: it.key, name: it.name,
-            status: 'fail', latency_ms: 0, error: '未返回检查结果',
-            hint: '检查请求失败,稍后重试', note: null,
-          })
+          merge(it.key, probed
+            ? { status: probed.status, latency_ms: probed.latency_ms, error: probed.error, hint: probed.hint, note: probed.note }
+            : { status: 'fail', error: '未返回检查结果', hint: '检查请求失败,稍后重试' })
         } catch (e) {
-          append({
-            category: it.category as SelfCheckItem['category'], key: it.key, name: it.name,
-            status: 'fail', latency_ms: 0,
-            error: e instanceof Error ? e.message : '请求失败',
-            hint: '检查请求失败,稍后重试', note: null,
-          })
+          merge(it.key, { status: 'fail', error: e instanceof Error ? e.message : '请求失败', hint: '检查请求失败,稍后重试' })
         }
       }
     }
     await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, items.length) }, () => worker()),
+      Array.from({ length: Math.min(CONCURRENCY, skeleton.length) }, () => worker()),
     )
     if (runId !== runIdRef.current) return
     setRunning(false)
   }, [notifySend])
 
-  // 打开自动开跑;关闭让在飞请求作废。
   useEffect(() => {
     if (open) void runCheck()
     else runIdRef.current++
-    // 仅依赖 open;notifySend 变更经「重新检查」触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   const heroGradient = 'bg-gradient-to-br from-violet-500 via-purple-500 to-indigo-500'
+
+  const renderCategory = (cat: string) => {
+    const catRows = rows.filter((r) => r.category === cat)
+    if (catRows.length === 0) return null
+    return (
+      <div key={cat} className="rounded-xl border border-border/40 bg-accent/20 p-3">
+        <div className="mb-2 text-[12px] font-semibold text-foreground">
+          {CATEGORY_LABELS[cat] ?? cat}
+        </div>
+        {cat === 'ai' ? (
+          <div className="space-y-3">
+            {groupByService(catRows).map(([svc, models]) => (
+              <div key={svc}>
+                <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
+                  {svc}
+                </div>
+                <div className="ml-3 space-y-2 border-l border-border/40 pl-3">
+                  {models.map((m) => <ItemRow key={m.key} item={m} />)}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {catRows.map((r) => <ItemRow key={r.key} item={r} />)}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
@@ -184,7 +259,7 @@ export default function SelfCheckModal({ open, onClose }: SelfCheckModalProps) {
           )}
         </div>
 
-        {/* 操作区:真实发送通知 + 重新检查 */}
+        {/* 操作区 */}
         <div className="mt-4 flex items-center justify-between gap-3">
           <label className="flex items-center gap-2 text-[12px] text-muted-foreground cursor-pointer select-none">
             <Switch checked={notifySend} disabled={running} onCheckedChange={setNotifySend} />
@@ -203,41 +278,8 @@ export default function SelfCheckModal({ open, onClose }: SelfCheckModalProps) {
           </div>
         )}
 
-        {/* 结果:逐项追加(出来一个显示一个) */}
-        <div className="mt-4 space-y-2">
-          {rows.map((item) => (
-            <div
-              key={`${item.category}:${item.key}`}
-              className="rounded-lg border border-border/40 bg-accent/20 px-3 py-2"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <StatusBadge status={item.status} />
-                  <span className="truncate text-[12px] font-medium text-foreground">{item.name}</span>
-                  <span className="flex-shrink-0 text-[10px] text-muted-foreground/60">
-                    {CATEGORY_LABELS[item.category] ?? item.category}
-                  </span>
-                </div>
-                <span className="flex-shrink-0 font-mono text-[11px] text-muted-foreground">
-                  {item.latency_ms}ms
-                </span>
-              </div>
-              {item.status === 'fail' && (
-                <div className="mt-1.5 space-y-1">
-                  {item.error && (
-                    <p className="truncate text-[11px] text-muted-foreground/70" title={item.error}>
-                      {item.error}
-                    </p>
-                  )}
-                  {item.hint && <p className="text-[11px] font-medium text-rose-600">{item.hint}</p>}
-                </div>
-              )}
-              {item.status !== 'fail' && item.note && (
-                <p className="mt-1.5 text-[11px] text-muted-foreground/70">{item.note}</p>
-              )}
-            </div>
-          ))}
-        </div>
+        {/* 分组明细:数据源 / AI模型(服务商→模型)/ 通知渠道 */}
+        <div className="mt-4 space-y-4">{CATEGORY_ORDER.map(renderCategory)}</div>
       </DialogContent>
     </Dialog>
   )

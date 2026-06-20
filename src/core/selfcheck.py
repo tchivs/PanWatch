@@ -147,21 +147,22 @@ def _enumerate(db) -> list[dict]:
     targets: list[dict] = []
     for src in db.query(DataSource).filter(DataSource.enabled.is_(True)).all():
         targets.append({"category": "datasource", "key": f"ds:{src.id}", "name": src.name,
-                        "_kind": "ds", "_obj": src})
+                        "group": None, "_kind": "ds", "_obj": src})
     for model in db.query(AIModel).all():
         service = db.query(AIService).filter(AIService.id == model.service_id).first()
         if not service:
             continue
+        # group = 服务商名,供前端做「服务商 → 模型」两级层级
         targets.append({"category": "ai", "key": f"ai:{model.id}", "name": model.name or model.model,
-                        "_kind": "ai", "_obj": model, "_service": service})
+                        "group": service.name, "_kind": "ai", "_obj": model, "_service": service})
     for ch in db.query(NotifyChannel).filter(NotifyChannel.enabled.is_(True)).all():
         targets.append({"category": "notify", "key": f"nc:{ch.id}", "name": ch.name or ch.type,
-                        "_kind": "nc", "_obj": ch})
+                        "group": None, "_kind": "nc", "_obj": ch})
     return targets
 
 
 def _identity(t: dict) -> dict:
-    return {"category": t["category"], "key": t["key"], "name": t["name"]}
+    return {"category": t["category"], "key": t["key"], "name": t["name"], "group": t.get("group")}
 
 
 def _probe_for(t: dict, notify_send: bool):
