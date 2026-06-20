@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Check, Eye, EyeOff, Plus, Pencil, Trash2, Star, Send, Cpu, Play, Download, Upload, FileJson, BarChart3, User } from 'lucide-react'
 import { fetchAPI, type AIService, type AIModel, type NotifyChannel } from '@panwatch/api'
 import { useAvatar, saveAvatar, fileToAvatarDataUrl } from '@/hooks/use-avatar'
+import SelfCheckPanel from '@/components/SelfCheckPanel'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
 import { Button } from '@panwatch/base-ui/components/ui/button'
@@ -565,6 +566,7 @@ export default function SettingsPage() {
     { id: 'sec-ai', label: 'AI', hint: `${services.length} 服务 / ${allModels.length} 模型` },
     { id: 'sec-notify', label: '通知', hint: `${enabledChannels.length}/${channels.length} 启用` },
     { id: 'sec-system', label: '系统', hint: health?.timezone ? `TZ ${health.timezone}` : undefined },
+    { id: 'sec-selfcheck', label: '系统自检' },
     { id: 'sec-pack', label: '配置包' },
     { id: 'sec-feedback', label: '反馈' },
   ]
@@ -866,6 +868,9 @@ export default function SettingsPage() {
             </div>
           </section>
         )}
+
+        {/* System Self-Check (Doctor) */}
+        <SelfCheckPanel />
 
         {/* Config Pack (Templates) */}
         <section id="sec-pack" className="card p-4 md:p-6 lg:col-span-7">
